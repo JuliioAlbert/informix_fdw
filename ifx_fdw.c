@@ -47,6 +47,7 @@
 
 #include "access/xact.h"
 #include "utils/lsyscache.h"
+#include "utils/fmgr.h"
 
 PG_MODULE_MAGIC;
 
@@ -1774,7 +1775,19 @@ ifxBeginForeignModify(ModifyTableState *mstate,
 
 	/*
 	 * Prepare and describe the statement.
+	 *
+	 * NOTE: For UPDATE with disable_rowid, we skip PREPARE/DESCRIBE here
+	 * because DESCRIBE INPUT fails on fragmented tables when the statement
+	 * uses WHERE CURRENT OF. Instead, we'll use EXECUTE IMMEDIATE during
+	 * execution with the full SQL including literal values.
 	 */
+	if (mstate->operation == CMD_UPDATE && !state->use_rowid)
+	{
+		elog(DEBUG1, "informix_fdw: skipping prepare/describe for UPDATE with disable_rowid");
+		ifxPgColumnData(foreignTableOid, state);
+		return;
+	}
+
 	ifxPrepareModifyQuery(&state->stmt_info, coninfo, mstate->operation);
 
 	/*
@@ -1817,7 +1830,7 @@ ifxBeginForeignModify(ModifyTableState *mstate,
 		}
 		else
 		{
-			/* CMD_UPDATE */
+			/* CMD_UPDATE with use_rowid */
 			state->stmt_info.descr_name = ifxGenDescrName(state->stmt_info.refid);
 			ifxDescribeStmtInput(&state->stmt_info);
 		}
@@ -2003,6 +2016,140 @@ ifxExecForeignDelete(EState *estate,
 	return slot;
 }
 
+/*
+ * Helper function to build UPDATE SQL with literal values for disable_rowid.
+ * This avoids DESCRIBE INPUT which fails on fragmented tables.
+ */
+static char *
+ifxBuildUpdateSqlWithValues(IfxFdwExecutionState *state,
+							TupleTableSlot *slot)
+{
+	StringInfoData sql;
+	ListCell      *cell;
+	bool           first;
+	char          *base_query;
+	char          *set_start;
+	char          *where_start;
+
+	/*
+	 * The base query is: UPDATE tablename SET col1 = ?, col2 = ? WHERE CURRENT OF cursor
+	 * We need to extract the table name and build a new query with literal values.
+	 */
+	base_query = state->stmt_info.query;
+
+	/* Find "SET " in the query */
+	set_start = strstr(base_query, " SET ");
+	if (set_start == NULL)
+		elog(ERROR, "informix_fdw: malformed UPDATE query");
+
+	/* Find "WHERE CURRENT OF" */
+	where_start = strstr(base_query, "WHERE CURRENT OF");
+	if (where_start == NULL)
+		elog(ERROR, "informix_fdw: expected WHERE CURRENT OF in query");
+
+	initStringInfo(&sql);
+
+	/* Copy "UPDATE tablename SET " */
+	appendBinaryStringInfo(&sql, base_query, (set_start - base_query) + 5);
+
+	/* Build column = value pairs */
+	first = true;
+	foreach(cell, state->affectedAttrNums)
+	{
+		int   attnum = lfirst_int(cell);
+		Datum datum;
+		bool  isnull = false;
+		Oid   typid;
+		char *colname;
+
+		if (!first)
+			appendStringInfoString(&sql, ", ");
+		first = false;
+
+		/* Get column name */
+		colname = NameStr(TupleDescAttr(slot->tts_tupleDescriptor, attnum - 1)->attname);
+		appendStringInfo(&sql, "%s = ", colname);
+
+		/* Get value */
+		datum = slot_getattr(slot, attnum, &isnull);
+		typid = TupleDescAttr(slot->tts_tupleDescriptor, attnum - 1)->atttypid;
+
+		if (isnull)
+		{
+			appendStringInfoString(&sql, "NULL");
+		}
+		else
+		{
+			/* Convert datum to literal based on type */
+			switch (typid)
+			{
+				case INT2OID:
+					appendStringInfo(&sql, "%d", DatumGetInt16(datum));
+					break;
+				case INT4OID:
+					appendStringInfo(&sql, "%d", DatumGetInt32(datum));
+					break;
+				case INT8OID:
+					appendStringInfo(&sql, "%ld", DatumGetInt64(datum));
+					break;
+				case FLOAT4OID:
+					appendStringInfo(&sql, "%f", DatumGetFloat4(datum));
+					break;
+				case FLOAT8OID:
+					appendStringInfo(&sql, "%f", DatumGetFloat8(datum));
+					break;
+				case VARCHAROID:
+				case TEXTOID:
+				case BPCHAROID:
+				{
+					char *strval = TextDatumGetCString(datum);
+					/* Escape single quotes by doubling them */
+					appendStringInfoChar(&sql, '\'');
+					for (char *p = strval; *p; p++)
+					{
+						if (*p == '\'')
+							appendStringInfoChar(&sql, '\'');
+						appendStringInfoChar(&sql, *p);
+					}
+					appendStringInfoChar(&sql, '\'');
+					pfree(strval);
+					break;
+				}
+				default:
+				{
+					/* For other types, use output function */
+					Oid   typoutput;
+					bool  typIsVarlena;
+					char *strval;
+
+					getTypeOutputInfo(typid, &typoutput, &typIsVarlena);
+					strval = OidOutputFunctionCall(typoutput, datum);
+
+					/* Assume string representation needs quoting */
+					appendStringInfoChar(&sql, '\'');
+					for (char *p = strval; *p; p++)
+					{
+						if (*p == '\'')
+							appendStringInfoChar(&sql, '\'');
+						appendStringInfoChar(&sql, *p);
+					}
+					appendStringInfoChar(&sql, '\'');
+					pfree(strval);
+					break;
+				}
+			}
+		}
+	}
+
+	/* Append WHERE CURRENT OF cursor */
+	appendStringInfoChar(&sql, ' ');
+	appendStringInfoString(&sql, where_start);
+
+	elog(DEBUG1, "informix_fdw: built UPDATE SQL: %s", sql.data);
+
+	return sql.data;
+}
+
 static TupleTableSlot *
 ifxExecForeignUpdate(EState *estate,
 					 ResultRelInfo *rinfo,
@@ -2015,6 +2162,25 @@ ifxExecForeignUpdate(EState *estate,
 
 	elog(DEBUG3, "informix_fdw: exec update with cursor \"%s\"",
 		 state->stmt_info.cursor_name);
+
+	/*
+	 * For UPDATE with disable_rowid (cursor-based), we cannot use
+	 * DESCRIBE INPUT because it fails on fragmented tables.
+	 * Instead, build the SQL with literal values and use EXECUTE IMMEDIATE.
+	 */
+	if (!state->use_rowid)
+	{
+		char *update_sql;
+
+		elog(DEBUG1, "informix_fdw: using EXECUTE IMMEDIATE for UPDATE with disable_rowid");
+
+		update_sql = ifxBuildUpdateSqlWithValues(state, slot);
+		ifxExecuteImmediate(update_sql);
+		ifxCatchExceptions(&state->stmt_info, 0);
+		pfree(update_sql);
+
+		return slot;
+	}
 
 	/*
 	 * NOTE:
@@ -2040,23 +2206,11 @@ ifxExecForeignUpdate(EState *estate,
 	 * For ROWIDs enabled (which is the default),
 	 * we need to get it back from the resjunk
 	 * column, pass it to the SQLDA structure and execute the
-	 * query. If we fall back to an updatable cursor,
-	 * it's enough to just execute the statement now, since
-	 * all columns values are already assigned to the SQLDA
-	 * structure above.
+	 * query.
 	 */
-	if (state->use_rowid)
-	{
-		/*
-		 * Assign the ROWID to the SQLDA structure.
-		 * We know that the last parameter id is
-		 * used by the ROWID within the WHERE clause
-		 * of this UPDATE.
-		 */
-		ifxRowIdValueToSqlda(state,
-							 state->stmt_info.ifxAttrCount - 1,
-							 planSlot);
-	}
+	ifxRowIdValueToSqlda(state,
+						 state->stmt_info.ifxAttrCount - 1,
+						 planSlot);
 
 	ifxExecuteStmtSqlda(&state->stmt_info);
 	ifxCatchExceptions(&state->stmt_info, 0);
@@ -4628,6 +4782,12 @@ ifxBeginForeignScan(ForeignScanState *node, int eflags)
 		 * by ifxPlanForeignScan().
 		 */
 		ifxDeserializeFdwData(festate, plan_values);
+
+		/*
+		 * Override use_rowid with current coninfo setting.
+		 * The serialized value may be stale/incorrect.
+		 */
+		festate->use_rowid = (coninfo->disable_rowid) ? false : true;
 	}
 
 	/*

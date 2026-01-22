@@ -645,6 +645,21 @@ void ifxDescribeStmtInput(IfxStatementInfo *state)
 	state->sqlda = (void *) ifx_sqlda;
 }
 
+/*
+ * Execute a SQL statement directly without preparing.
+ * Used for UPDATE with disable_rowid where DESCRIBE INPUT fails
+ * on fragmented tables.
+ */
+void ifxExecuteImmediate(char *sql_query)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	char *ifx_sql;
+	EXEC SQL END DECLARE SECTION;
+
+	ifx_sql = sql_query;
+	EXEC SQL EXECUTE IMMEDIATE :ifx_sql;
+}
+
 void ifxSetDescriptorCount(char *descr_name, int count)
 {
 	EXEC SQL BEGIN DECLARE SECTION;

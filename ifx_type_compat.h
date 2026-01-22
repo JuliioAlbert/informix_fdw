@@ -650,6 +650,7 @@ IfxIndicatorValue ifxSetSqlVarIndicator(IfxStatementInfo *info, int ifx_attnum,
 void ifxExecuteStmt(IfxStatementInfo *state);
 void ifxDescribeStmtInput(IfxStatementInfo *state);
 void ifxExecuteStmtSqlda(IfxStatementInfo *state);
+void ifxExecuteImmediate(char *sql_query);
 IfxTemporalRange ifxGetTemporalQualifier(IfxStatementInfo *state,
 										 int ifx_attnum);
 
