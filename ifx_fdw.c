@@ -1021,11 +1021,14 @@ ifxIsForeignRelUpdatable(Relation rel)
 		}
 
 		/*
-		 * Don't allow DML on foreign tables defined with disable_rowid.
+		 * Allow DML on foreign tables defined with disable_rowid.
+		 * UPDATE and DELETE will use WHERE CURRENT OF cursor.
+		 * Note: UPDATE...FROM and DELETE...USING are not supported
+		 * with this option since the cursor position may be incorrect.
 		 */
 		if (strcmp(def->defname, "disable_rowid") == 0)
 		{
-			return (1 << CMD_INSERT) | (0 << CMD_UPDATE) | (0 << CMD_DELETE);
+			return (1 << CMD_INSERT) | (1 << CMD_UPDATE) | (1 << CMD_DELETE);
 		}
 	}
 
