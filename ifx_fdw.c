@@ -1720,7 +1720,15 @@ ifxBeginForeignModify(ModifyTableState *mstate,
 	rinfo->ri_FdwState = state;
 
 	/*
+	 * Deserialize plan data first.
+	 */
+	ifxDeserializeFdwData(state, fdw_private);
+
+	/*
 	 * Mark usage of ROWID in this modify action.
+	 * NOTE: This must be done AFTER deserializing plan data,
+	 * since the serialized use_rowid value may be stale/incorrect.
+	 * We always use the current coninfo->disable_rowid setting.
 	 */
 	state->use_rowid = (coninfo->disable_rowid ? false : true);
 
@@ -1756,11 +1764,6 @@ ifxBeginForeignModify(ModifyTableState *mstate,
 		 */
 		elog(DEBUG1, "informix_fdw: using cursor based modify actions");
 	}
-
-	/*
-	 * Deserialize plan data.
-	 */
-	ifxDeserializeFdwData(state, fdw_private);
 
 	/* EXPLAIN without ANALYZE... */
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
