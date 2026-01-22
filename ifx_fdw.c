@@ -47,7 +47,6 @@
 
 #include "access/xact.h"
 #include "utils/lsyscache.h"
-#include "utils/fmgr.h"
 
 PG_MODULE_MAGIC;
 
